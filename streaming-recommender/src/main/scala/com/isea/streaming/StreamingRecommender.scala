@@ -1,0 +1,245 @@
+package com.isea.streaming
+
+
+
+import com.mongodb.casbah.commons.MongoDBObject
+import com.mongodb.casbah.{MongoClient, MongoClientURI}
+import org.apache.kafka.common.serialization.StringDeserializer
+import org.apache.spark.SparkConf
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.streaming.kafka010.{ConsumerStrategies, KafkaUtils, LocationStrategies}
+import org.apache.spark.streaming.{Seconds, StreamingContext}
+import redis.clients.jedis.Jedis
+
+import scala.collection.JavaConversions._
+
+object ConnHelper extends Serializable{
+  lazy val jedis = new Jedis("hadoop101")
+  lazy val mongoClient = MongoClient(MongoClientURI("mongodb://hadoop101:27017/recommender"))
+}
+
+case class MongConfig(uri:String,db:String)
+
+//推荐
+case class Recommendation(rid:Int, r:Double)
+
+// 用户的推荐
+case class UserRecs(uid:Int, recs:Seq[Recommendation])
+
+//电影的相似度
+case class MovieRecs(mid:Int, recs:Seq[Recommendation])
+
+
+object StreamingRecommender {
+  val MAX_USER_RATINGS_NUM = 20 // 最大的用户评分数量
+  val MAX_SIM_MOVIES_NUM = 20 // 最大的相似电影的个数，从redis中获取
+  val MONGODB_STREAM_RECS_COLLECTION = "StreamRecs"  // 最新的推荐列表的表名
+  val MONGODB_RATING_COLLECTION = "Rating" // 从MongoDB中取出打分表
+  val MONGODB_MOVIE_RECS_COLLECTION = "MovieRecs" // ALS出来的电影相似度矩阵
+
+  def main(args: Array[String]): Unit = {
+    val config = Map(
+      "spark.cores" -> "local[*]",
+      "mongo.uri" -> "mongodb://hadoop101:27017/recommender",
+      "mongo.db" -> "recommender",
+      "kafka.topic" -> "recommender"
+    )
+
+    //创建一个SparkConf配置
+    val sparkConf = new SparkConf().setAppName("StreamingRecommender").setMaster(config("spark.cores"))
+
+    //创建Spark的对象, 因为spark session中没有封装streaming context，所以需要new一个
+    val spark = SparkSession.builder().config(sparkConf).getOrCreate()
+    val sc = spark.sparkContext
+    val ssc = new StreamingContext(sc,Seconds(2))
+
+    implicit val mongConfig = MongConfig(config("mongo.uri"),config("mongo.db"))
+    import spark.implicits._
+
+
+    //******************  广播电影相似度矩阵
+
+    /* 为了性能考虑，把相似度矩阵这个大数据广播出去；广播变量的好处：不是每个task一份变量副本，而是变成每个节点的executor才一份副本
+       装换成为 Map[Int, Map[Int,Double]]
+        (mid,[(mid,score),(mid,score),(mid,score)...]) 将其变为
+        {
+          mid:{mid:score,mid:score,mid:score...}
+        }
+
+     */
+    val simMoviesMatrix = spark
+      .read
+      .option("uri",config("mongo.uri"))
+      .option("collection",MONGODB_MOVIE_RECS_COLLECTION)
+      .format("com.mongodb.spark.sql")
+      .load()
+      .as[MovieRecs]
+      .rdd
+      .map{recs =>
+        (recs.mid,recs.recs.map(x=> (x.rid,x.r)).toMap)
+      }.collectAsMap()  // 把元组转换为map，以mid为key，推荐列表为value
+
+    val simMoviesMatrixBroadCast = sc.broadcast(simMoviesMatrix)
+
+    val abc = sc.makeRDD(1 to 2)
+    abc.map(x=> simMoviesMatrixBroadCast.value.get(1)).count()
+
+    //******************
+    //创建到Kafka的连接
+    val kafkaPara = Map(
+      "bootstrap.servers" -> "hadoop101:9092",
+      "key.deserializer" -> classOf[StringDeserializer],
+      "value.deserializer" -> classOf[StringDeserializer],
+      "group.id" -> "recommender",
+      "auto.offset.reset" -> "latest"    //每次从kafka 消费数据，都是通过zookeeper存储的数据offset，来判断需要获取消息在消息日志里的起始位置
+    )
+
+    val kafkaStream = KafkaUtils.createDirectStream[String,String](ssc,LocationStrategies.PreferConsistent,ConsumerStrategies.Subscribe[String,String](Array(config("kafka.topic")),kafkaPara))
+
+    // UID|MID|SCORE|TIMESTAMP  产生评分流的数据格式
+    //
+    val ratingStream = kafkaStream.map{case msg=>
+      var attr = msg.value().split("\\|")            // split方法对. | * + ^需要转义（类似正则）
+      (attr(0).toInt,attr(1).toInt,attr(2).toDouble,attr(3).toInt)
+    }
+
+    ratingStream.foreachRDD{rdd =>
+      rdd.map{case (uid,mid,score,timestamp) =>
+        println(">>>>>>>>>>>>>>>>")
+
+        //获取当前最近的M次电影评分，去redis中获取，第一次评分的时候，redis中没有数据，结构为uid，score
+        val userRecentlyRatings = getUserRecentlyRating(MAX_USER_RATINGS_NUM,uid,ConnHelper.jedis)
+
+        //获取电影P最相似的K个电影
+        val simMovies = getTopSimMovies(MAX_SIM_MOVIES_NUM,mid,uid,simMoviesMatrixBroadCast.value)
+
+        //计算待选电影的推荐优先级；总的电影相似度矩阵，用户的最近K次评分，和当前电影P最相似的K个电影
+        val streamRecs = computeMovieScores(simMoviesMatrixBroadCast.value,userRecentlyRatings,simMovies)
+
+        //将数据保存到MongoDB
+        saveRecsToMongoDB(uid,streamRecs)
+
+      }.count()
+    }
+
+    //启动Streaming程序
+    ssc.start()
+    ssc.awaitTermination()
+
+  }
+
+
+
+  /**
+    * 将数据保存到MongoDB    uid -> 1,  recs -> 22:4.5|45:3.8
+    * @param streamRecs  流式的推荐结果
+    * @param mongConfig  MongoDB的配置
+    */
+  def saveRecsToMongoDB(uid:Int,streamRecs:Array[(Int,Double)])(implicit mongConfig: MongConfig): Unit ={
+    //到StreamRecs的连接
+    val streamRecsCollection = ConnHelper.mongoClient(mongConfig.db)(MONGODB_STREAM_RECS_COLLECTION)
+
+    streamRecsCollection.findAndRemove(MongoDBObject("uid" -> uid))
+    //streaRecsCollection.insert(MongoDBObject("uid" -> uid, "recs" -> streamRecs.map(x=> x._1+":"+x._2).mkString("|")))
+    streamRecsCollection.insert(MongoDBObject("uid"->uid, "recs"-> streamRecs.map(x => MongoDBObject("mid"->x._1, "score"->x._2)) ))
+
+  }
+
+  /**
+    * 计算待选电影的推荐分数
+    * @param simMovies            电影相似度矩阵
+    * @param userRecentlyRatings  用户最近的k次评分
+    * @param topSimMovies         当前电影最相似的K个电影
+    * @return
+    */
+  def computeMovieScores(simMovies:scala.collection.Map[Int,scala.collection.immutable.Map[Int,Double]],userRecentlyRatings:Array[(Int,Double)],topSimMovies: Array[Int]): Array[(Int,Double)] ={
+
+    //用于保存每一个待选电影和最近评分的每一个电影的权重得分，ArrayBuffer可变类型。
+    val score = scala.collection.mutable.ArrayBuffer[(Int,Double)]()
+
+    //用于保存每一个电影的增强因子数
+    val increMap = scala.collection.mutable.HashMap[Int,Int]()
+
+    //用于保存每一个电影的减弱因子数
+    val decreMap = scala.collection.mutable.HashMap[Int,Int]()
+
+
+    // 遍历和当前电影p【最相似的K个电影】，计算当前电影q的权重，然后遍历【最近K次评分】中和q相似的电影们，
+    for (topSimMovie <- topSimMovies; userRecentlyRating <- userRecentlyRatings){
+      // 遍历最近K次评分中和q相似的电影们中的r ，从总的ASL电影相似度矩阵中，获取r和电影q 的相似度，
+      val simScore = getMoviesSimScore(simMovies,userRecentlyRating._1,topSimMovie)
+      if(simScore > 0.6){
+        // (mid,q和r的相似度 * r的评分),该元素会组成一个list
+        score += ((topSimMovie, simScore * userRecentlyRating._2 ))
+        if(userRecentlyRating._2 > 3){
+          // 最近K次评分中和电影q相似，且评分较高的电影个数，不断加一 作为奖励
+          increMap(topSimMovie) = increMap.getOrDefault(topSimMovie,0) + 1
+        }else{// 最近K次评分中和电影q相似，且评分较低的电影个数，作为惩罚
+          decreMap(topSimMovie) = decreMap.getOrDefault(topSimMovie,0) + 1
+        }
+      }
+    }
+
+    // 最后计算q的推荐优先级的公式的scala翻译
+    score.groupBy(_._1).map{case (mid,sims) => // 按照mid聚合,sims是一个list，是q和 最近的K次评分中的r作用的结果
+      (mid,sims.map(_._2).sum / sims.length + log(increMap.getOrDefault(mid, 1)) - log(decreMap.getOrDefault(mid, 1)))
+    }.toArray
+
+  }
+
+  //取2的对数
+  def log(m:Int):Double ={
+    math.log(m) / math.log(2)
+  }
+
+  /**
+    * 获取当个电影之间的相似度
+    * @param simMovies       电影相似度矩阵
+    * @param userRatingMovie 用户已经评分的电影
+    * @param topSimMovie     最相似的K个电影中的候选电影q
+    * @return
+    */
+  def getMoviesSimScore(simMovies:scala.collection.Map[Int,scala.collection.immutable.Map[Int,Double]], userRatingMovie:Int, topSimMovie:Int): Double ={
+    simMovies.get(topSimMovie) match {
+      case Some(sim) => sim.get(userRatingMovie) match {
+        case Some(score) => score
+        case None => 0.0
+      }
+      case None => 0.0
+    }
+  }
+
+  /**
+    * 获取当前电影K个相似的电影
+    * @param num          相似电影的数量
+    * @param mid          当前电影的ID
+    * @param uid          当前的评分用户
+    * @param simMovies    电影相似度矩阵的广播变量值
+    * @param mongConfig   MongoDB的配置
+    * @return
+    */
+  def getTopSimMovies(num:Int, mid:Int, uid:Int, simMovies:scala.collection.Map[Int,scala.collection.immutable.Map[Int,Double]])(implicit mongConfig: MongConfig): Array[Int] ={
+    //从广播变量的电影相似度矩阵中获取当前电影所有的相似电影
+    val allSimMovies = simMovies(mid).toArray
+    //获取用户已经观看过得电影
+    val ratingExist = ConnHelper.mongoClient(mongConfig.db)(MONGODB_RATING_COLLECTION).find(MongoDBObject("uid" -> uid)).toArray.map{item =>
+      item.get("mid").toString.toInt
+    }
+    //过滤掉已经评分过得电影，并排序输出
+    allSimMovies.filter(x => !ratingExist.contains(x._1)).sortWith(_._2 > _._2).take(num).map(x => x._1)
+  }
+
+  /**
+    * 获取当前最近的M次电影评分
+    * @param num  评分的个数
+    * @param uid  谁的评分
+    * @return
+    */
+  def getUserRecentlyRating(num:Int, uid:Int,jedis:Jedis): Array[(Int,Double)] ={
+    //从用户的队列中取出num个评分
+    jedis.lrange("uid:"+uid.toString, 0, num).map{item =>
+      val attr = item.split("\\:")
+      (attr(0).trim.toInt, attr(1).trim.toDouble) // 第一个是mid，第二个是打分
+    }.toArray
+  }
+}
